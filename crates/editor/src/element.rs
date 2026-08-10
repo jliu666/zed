@@ -1354,22 +1354,22 @@ impl EditorElement {
             .then_some(content_offset)
             .unwrap_or_default();
 
-        let is_rewrapping = self.editor.read(cx).display_map.read(cx).is_rewrapping(cx);
-        let frozen_layout_information = self
-            .editor
-            .update(cx, |editor, _| {
-                editor.frozen_scroll_range_width(
-                    is_rewrapping,
-                    scrollbar_layout_information.scroll_range.width,
-                )
-            })
-            .map(|scroll_range_width| ScrollbarLayoutInformation {
-                scroll_range: size(
-                    scroll_range_width,
-                    scrollbar_layout_information.scroll_range.height,
-                ),
-                ..*scrollbar_layout_information
-            });
+        let frozen_layout_information = if self.editor.read(cx).scroll_range_hold.is_some() {
+            let is_rewrapping = self.editor.read(cx).display_map.read(cx).is_rewrapping(cx);
+            self.editor
+                .update(cx, |editor, _| {
+                    editor.frozen_scroll_range(
+                        is_rewrapping,
+                        scrollbar_layout_information.scroll_range,
+                    )
+                })
+                .map(|scroll_range| ScrollbarLayoutInformation {
+                    scroll_range,
+                    ..*scrollbar_layout_information
+                })
+        } else {
+            None
+        };
 
         Some(EditorScrollbars::from_scrollbar_axes(
             ScrollbarAxes {
