@@ -1,6 +1,9 @@
 use super::{
     Highlights,
-    fold_map::{self, Chunk, FoldChunks, FoldEdit, FoldPoint, FoldSnapshot},
+    fold_map::{
+        self, Chunk, FoldChunks, FoldEdit, FoldOffset, FoldPoint, FoldPointToOffsetConverter,
+        FoldSnapshot,
+    },
 };
 
 use language::{LanguageAwareStyling, Point};
@@ -75,6 +78,8 @@ impl TabMap {
 
         let old_fold_max_point = old_snapshot.fold_snapshot.max_point();
 
+        let any_tabs = old_snapshot.fold_snapshot.has_tabs() || fold_snapshot.has_tabs();
+
         // Expand each edit to include the next tab on the same line as the edit,
         // and any subsequent tabs on that line that moved across the tab expansion
         // boundary.
@@ -91,6 +96,9 @@ impl TabMap {
         // rendered width may have changed) and the last tab that crossed the
         // expansion boundary (transitioning between expanded and non-expanded).
         for fold_edit in &mut fold_edits {
+            if !any_tabs {
+                break;
+            }
             let old_end = fold_edit.old.end.to_point(&old_snapshot.fold_snapshot);
             let old_end_row_successor_offset =
                 cmp::min(FoldPoint::new(old_end.row() + 1, 0), old_fold_max_point)
@@ -173,21 +181,24 @@ impl TabMap {
             .collect();
         v.push(first_edit);
         debug_assert_eq!(v.as_ptr(), _old_alloc_ptr, "Fold edits were reallocated");
-        let tab_edits = v
-            .into_iter()
-            .map(|fold_edit| {
-                let old_start = fold_edit.old.start.to_point(&old_snapshot.fold_snapshot);
-                let old_end = fold_edit.old.end.to_point(&old_snapshot.fold_snapshot);
-                let new_start = fold_edit.new.start.to_point(&new_snapshot.fold_snapshot);
-                let new_end = fold_edit.new.end.to_point(&new_snapshot.fold_snapshot);
-                TabEdit {
-                    old: old_snapshot.fold_point_to_tab_point(old_start)
-                        ..old_snapshot.fold_point_to_tab_point(old_end),
-                    new: new_snapshot.fold_point_to_tab_point(new_start)
-                        ..new_snapshot.fold_point_to_tab_point(new_end),
-                }
-            })
-            .collect();
+        let tab_edits = {
+            let mut old_converter = old_snapshot.fold_snapshot.fold_offset_to_point_converter();
+            let mut new_converter = new_snapshot.fold_snapshot.fold_offset_to_point_converter();
+            v.into_iter()
+                .map(|fold_edit| {
+                    let old_start = old_converter.map(fold_edit.old.start);
+                    let old_end = old_converter.map(fold_edit.old.end);
+                    let new_start = new_converter.map(fold_edit.new.start);
+                    let new_end = new_converter.map(fold_edit.new.end);
+                    TabEdit {
+                        old: old_snapshot.fold_point_to_tab_point(old_start)
+                            ..old_snapshot.fold_point_to_tab_point(old_end),
+                        new: new_snapshot.fold_point_to_tab_point(new_start)
+                            ..new_snapshot.fold_point_to_tab_point(new_end),
+                    }
+                })
+                .collect()
+        };
         *old_snapshot = new_snapshot;
         (old_snapshot.clone(), tab_edits)
     }
@@ -236,8 +247,8 @@ impl TabSnapshot {
 
     #[ztracing::instrument(skip_all, fields(rows))]
     pub fn text_summary_for_range(&self, range: Range<TabPoint>) -> TextSummary {
-        let input_start = self.tab_point_to_fold_point(range.start, Bias::Left).0;
-        let input_end = self.tab_point_to_fold_point(range.end, Bias::Right).0;
+        let input_start = self.collapse_tab_point(range.start, Bias::Left);
+        let input_end = self.collapse_tab_point(range.end, Bias::Right);
         let input_summary = self
             .fold_snapshot
             .text_summary_for_range(input_start..input_end);
@@ -355,23 +366,52 @@ impl TabSnapshot {
 
     #[ztracing::instrument(skip_all)]
     pub fn clip_point(&self, point: TabPoint, bias: Bias) -> TabPoint {
+        if !self.fold_snapshot.has_tabs() {
+            return TabPoint(self.fold_snapshot.clip_point(FoldPoint(point.0), bias).0);
+        }
         self.fold_point_to_tab_point(
             self.fold_snapshot
-                .clip_point(self.tab_point_to_fold_point(point, bias).0, bias),
+                .clip_point(self.collapse_tab_point(point, bias), bias),
         )
     }
 
     #[ztracing::instrument(skip_all)]
     pub fn fold_point_to_tab_point(&self, input: FoldPoint) -> TabPoint {
+        if !self.fold_snapshot.has_tabs() {
+            return TabPoint(input.0);
+        }
         let chunks = self.fold_snapshot.chunks_at(FoldPoint::new(input.row(), 0));
-        let tab_cursor = TabStopCursor::new(chunks);
-        let expanded = self.expand_tabs(tab_cursor, input.column());
+        let mut tab_cursor = TabStopCursor::new(chunks);
+        let expanded = self.expand_tabs(&mut tab_cursor, input.column());
         TabPoint::new(input.row(), expanded)
     }
 
     #[ztracing::instrument(skip_all)]
     pub fn tab_point_cursor(&self) -> TabPointCursor<'_> {
-        TabPointCursor { this: self }
+        TabPointCursor {
+            snapshot: self,
+            scanner: None,
+            row_start_offset: None,
+            last: None,
+        }
+    }
+
+    #[ztracing::instrument(skip_all)]
+    pub fn tab_point_to_fold_point_converter(&self) -> TabPointToFoldPointConverter<'_> {
+        TabPointToFoldPointConverter {
+            snapshot: self,
+            scanner: None,
+            row_start_offset: None,
+            last: None,
+        }
+    }
+
+    #[ztracing::instrument(skip_all)]
+    pub fn collapse_tab_point(&self, output: TabPoint, bias: Bias) -> FoldPoint {
+        if !self.fold_snapshot.has_tabs() {
+            return FoldPoint(output.0);
+        }
+        self.tab_point_to_fold_point(output, bias).0
     }
 
     #[ztracing::instrument(skip_all)]
@@ -380,10 +420,10 @@ impl TabSnapshot {
             .fold_snapshot
             .chunks_at(FoldPoint::new(output.row(), 0));
 
-        let tab_cursor = TabStopCursor::new(chunks);
+        let mut tab_cursor = TabStopCursor::new(chunks);
         let expanded = output.column();
         let (collapsed, expanded_char_column, to_next_stop) =
-            self.collapse_tabs(tab_cursor, expanded, bias);
+            self.collapse_tabs(&mut tab_cursor, expanded, bias);
 
         (
             FoldPoint::new(output.row(), collapsed),
@@ -406,7 +446,7 @@ impl TabSnapshot {
 
     #[ztracing::instrument(skip_all)]
     pub fn tab_point_to_point(&self, point: TabPoint, bias: Bias) -> Point {
-        let fold_point = self.tab_point_to_fold_point(point, bias).0;
+        let fold_point = self.collapse_tab_point(point, bias);
         let inlay_point = fold_point.to_inlay_point(&self.fold_snapshot);
         self.fold_snapshot
             .inlay_snapshot
@@ -414,7 +454,7 @@ impl TabSnapshot {
     }
 
     #[ztracing::instrument(skip_all)]
-    fn expand_tabs<'a>(&self, mut cursor: TabStopCursor<'a>, column: u32) -> u32 {
+    fn expand_tabs(&self, cursor: &mut TabStopCursor<'_>, column: u32) -> u32 {
         // we only ever act on a single row at a time
         // so the main difference is that other layers build a transform sumtree, and can then just run through that
         // we cant quite do this here, as we need to work with the previous layer chunk to understand the tabs of the corresponding row
@@ -449,9 +489,9 @@ impl TabSnapshot {
     }
 
     #[ztracing::instrument(skip_all)]
-    fn collapse_tabs<'a>(
+    fn collapse_tabs(
         &self,
-        mut cursor: TabStopCursor<'a>,
+        cursor: &mut TabStopCursor<'_>,
         column: u32,
         bias: Bias,
     ) -> (u32, u32, u32) {
@@ -505,19 +545,109 @@ impl TabSnapshot {
     }
 }
 
-// todo(lw): Implement TabPointCursor properly
-pub struct TabPointCursor<'this> {
-    this: &'this TabSnapshot,
+struct TabRowScanner<'a> {
+    fold_offset_converter: FoldPointToOffsetConverter<'a>,
+    tab_stop_cursor: TabStopCursor<'a>,
+}
+
+impl<'a> TabRowScanner<'a> {
+    fn new(fold_snapshot: &'a FoldSnapshot) -> Self {
+        Self {
+            fold_offset_converter: fold_snapshot.fold_point_to_offset_converter(),
+            tab_stop_cursor: TabStopCursor::new(fold_snapshot.chunks_at(FoldPoint::default())),
+        }
+    }
+
+    fn seek_to_row(
+        &mut self,
+        snapshot: &TabSnapshot,
+        row: u32,
+        row_start_offset: &mut Option<(u32, FoldOffset)>,
+    ) {
+        let row_start = match *row_start_offset {
+            Some((cached_row, offset)) if cached_row == row => offset,
+            _ => {
+                let offset = self.fold_offset_converter.map(FoldPoint::new(row, 0));
+                *row_start_offset = Some((row, offset));
+                offset
+            }
+        };
+        self.tab_stop_cursor
+            .seek(row_start..snapshot.fold_snapshot.len());
+    }
+}
+
+pub struct TabPointCursor<'a> {
+    snapshot: &'a TabSnapshot,
+    scanner: Option<TabRowScanner<'a>>,
+    row_start_offset: Option<(u32, FoldOffset)>,
+    last: Option<(FoldPoint, TabPoint)>,
 }
 
 impl TabPointCursor<'_> {
-    /// No-op; this cursor is stateless. Provided for symmetry with the other
-    /// display-map layer cursors.
-    pub fn reset(&mut self) {}
+    pub fn reset(&mut self) {
+        self.row_start_offset = None;
+        self.last = None;
+    }
 
     #[ztracing::instrument(skip_all)]
     pub fn map(&mut self, point: FoldPoint) -> TabPoint {
-        self.this.fold_point_to_tab_point(point)
+        if !self.snapshot.fold_snapshot.has_tabs() {
+            return TabPoint(point.0);
+        }
+        if let Some((last_input, last_output)) = self.last
+            && last_input == point
+        {
+            return last_output;
+        }
+
+        let snapshot = self.snapshot;
+        let scanner = self
+            .scanner
+            .get_or_insert_with(|| TabRowScanner::new(&snapshot.fold_snapshot));
+        scanner.seek_to_row(snapshot, point.row(), &mut self.row_start_offset);
+        let expanded = snapshot.expand_tabs(&mut scanner.tab_stop_cursor, point.column());
+        let output = TabPoint::new(point.row(), expanded);
+        self.last = Some((point, output));
+        output
+    }
+}
+
+pub struct TabPointToFoldPointConverter<'a> {
+    snapshot: &'a TabSnapshot,
+    scanner: Option<TabRowScanner<'a>>,
+    row_start_offset: Option<(u32, FoldOffset)>,
+    last: Option<(TabPoint, Bias, FoldPoint)>,
+}
+
+impl TabPointToFoldPointConverter<'_> {
+    pub fn reset(&mut self) {
+        self.row_start_offset = None;
+        self.last = None;
+    }
+
+    #[ztracing::instrument(skip_all)]
+    pub fn map(&mut self, output: TabPoint, bias: Bias) -> FoldPoint {
+        if !self.snapshot.fold_snapshot.has_tabs() {
+            return FoldPoint(output.0);
+        }
+        if let Some((last_input, last_bias, last_output)) = self.last
+            && last_input == output
+            && last_bias == bias
+        {
+            return last_output;
+        }
+
+        let snapshot = self.snapshot;
+        let scanner = self
+            .scanner
+            .get_or_insert_with(|| TabRowScanner::new(&snapshot.fold_snapshot));
+        scanner.seek_to_row(snapshot, output.row(), &mut self.row_start_offset);
+        let (collapsed, _, _) =
+            snapshot.collapse_tabs(&mut scanner.tab_stop_cursor, output.column(), bias);
+        let result = FoldPoint::new(output.row(), collapsed);
+        self.last = Some((output, bias, result));
+        result
     }
 }
 
@@ -801,6 +931,13 @@ impl<'a> TabStopCursor<'a> {
             char_offset: 0,
             current_chunk: None,
         }
+    }
+
+    fn seek(&mut self, range: Range<FoldOffset>) {
+        self.chunks.seek(range);
+        self.byte_offset = 0;
+        self.char_offset = 0;
+        self.current_chunk = None;
     }
 
     fn bytes_until_next_char(&self) -> Option<usize> {
@@ -1463,7 +1600,9 @@ mod tests {
                 max_fold_point.column()
             };
             let column = rng.random_range(0..=max_column + 10);
-            let fold_point = FoldPoint::new(row, column);
+            tab_snapshot.fold_point_to_tab_point(FoldPoint::new(row, column));
+
+            let fold_point = fold_snapshot.clip_point(FoldPoint::new(row, column), Bias::Left);
 
             let actual = tab_snapshot.fold_point_to_tab_point(fold_point);
             let expected = tab_snapshot.expected_to_tab_point(fold_point);

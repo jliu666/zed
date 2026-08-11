@@ -995,6 +995,10 @@ impl<'snap, 'a> MutableSelectionsCollection<'snap, 'a> {
     ) {
         let mut changed = false;
         let display_map = self.display_snapshot();
+        let mut converter = display_map.display_point_to_point_converter();
+        let mut offset_converter = display_map
+            .buffer_snapshot()
+            .point_dimension_converter::<MultiBufferOffset>();
         let selections = self.collection.all_display(&display_map);
         let selections = selections
             .into_iter()
@@ -1004,7 +1008,13 @@ impl<'snap, 'a> MutableSelectionsCollection<'snap, 'a> {
                 if selection != moved_selection {
                     changed = true;
                 }
-                moved_selection.map(|display_point| display_point.to_point(&display_map))
+                Selection {
+                    id: moved_selection.id,
+                    start: offset_converter.map(converter.map(moved_selection.start, Bias::Left)),
+                    end: offset_converter.map(converter.map(moved_selection.end, Bias::Left)),
+                    reversed: moved_selection.reversed,
+                    goal: moved_selection.goal,
+                }
             })
             .collect();
 
@@ -1172,9 +1182,10 @@ fn resolve_selections_display<'a>(
     selections: impl 'a + IntoIterator<Item = &'a Selection<Anchor>>,
     map: &'a DisplaySnapshot,
 ) -> impl 'a + Iterator<Item = Selection<DisplayPoint>> {
+    let mut converter = map.point_to_display_point_converter();
     let selections = resolve_selections_point(selections, map).map(move |s| {
-        let display_start = map.point_to_display_point(s.start, Bias::Left);
-        let display_end = map.point_to_display_point(
+        let display_start = converter.map(s.start, Bias::Left);
+        let display_end = converter.map(
             s.end,
             if s.start == s.end {
                 Bias::Right

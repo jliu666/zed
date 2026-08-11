@@ -920,6 +920,7 @@ pub struct MBTextSummary {
     pub longest_row: u32,
     /// How many `char`s are in the longest row
     pub longest_row_chars: u32,
+    pub tabs: usize,
 }
 
 impl From<TextSummary> for MBTextSummary {
@@ -934,6 +935,7 @@ impl From<TextSummary> for MBTextSummary {
             last_line_len_utf16: summary.last_line_len_utf16,
             longest_row: summary.longest_row,
             longest_row_chars: summary.longest_row_chars,
+            tabs: summary.tabs,
         }
     }
 }
@@ -950,6 +952,7 @@ impl From<MBTextSummary> for TextSummary {
             last_line_len_utf16: summary.last_line_len_utf16,
             longest_row: summary.longest_row,
             longest_row_chars: summary.longest_row_chars,
+            tabs: summary.tabs,
         }
     }
 }
@@ -1004,6 +1007,7 @@ impl AddAssign for MBTextSummary {
         self.len += other.len;
         self.len_utf16 += other.len_utf16;
         self.lines += other.lines;
+        self.tabs += other.tabs;
     }
 }
 
@@ -1127,6 +1131,111 @@ struct MultiBufferCursor<'a, MBD, BD> {
     diff_transforms: Cursor<'a, 'static, DiffTransform, DiffTransforms<MBD>>,
     cached_region: OnceCell<Option<MultiBufferRegion<'a, MBD, BD>>>,
     snapshot: &'a MultiBufferSnapshot,
+}
+
+pub struct DimensionConverter<'a, MBR1, MBR2, BR1, BR2>
+where
+    MBR1: MultiBufferDimension + Ord + Sub + ops::AddAssign<<MBR1 as Sub>::Output>,
+    BR1: TextDimension + Sub<Output = <MBR1 as Sub>::Output> + AddAssign<<MBR1 as Sub>::Output>,
+    MBR2: MultiBufferDimension + Ord + Sub + ops::AddAssign<<MBR2 as Sub>::Output>,
+    BR2: TextDimension + Sub<Output = <MBR2 as Sub>::Output> + AddAssign<<MBR2 as Sub>::Output>,
+{
+    snapshot: &'a MultiBufferSnapshot,
+    singleton_buffer: Option<&'a BufferSnapshot>,
+    cursor: MultiBufferCursor<'a, DimensionPair<MBR1, MBR2>, DimensionPair<BR1, BR2>>,
+    convert_buffer_dimension: fn(&text::BufferSnapshot, BR1) -> BR2,
+    prev_key: Option<MBR1>,
+}
+
+impl<MBR1, MBR2, BR1, BR2> DimensionConverter<'_, MBR1, MBR2, BR1, BR2>
+where
+    MBR1: MultiBufferDimension + Ord + Sub + ops::AddAssign<<MBR1 as Sub>::Output>,
+    BR1: TextDimension + Sub<Output = <MBR1 as Sub>::Output> + AddAssign<<MBR1 as Sub>::Output>,
+    MBR2: MultiBufferDimension + Ord + Sub + ops::AddAssign<<MBR2 as Sub>::Output>,
+    BR2: TextDimension + Sub<Output = <MBR2 as Sub>::Output> + AddAssign<<MBR2 as Sub>::Output>,
+{
+    pub fn map(&mut self, key: MBR1) -> MBR2 {
+        if let Some(buffer) = self.singleton_buffer {
+            let key = cmp::min(key, self.snapshot.max_position());
+            let mut buffer_key = BR1::default();
+            buffer_key += key - MBR1::default();
+            let buffer_value = (self.convert_buffer_dimension)(buffer, buffer_key);
+            let mut result = MBR2::default();
+            result += buffer_value - BR2::default();
+            return result;
+        }
+        let position = DimensionPair { key, value: None };
+        if self.prev_key.is_some_and(|prev_key| key >= prev_key) {
+            self.cursor.seek_forward(&position);
+        } else {
+            self.cursor.seek(&position);
+        }
+        self.prev_key = Some(key);
+
+        if let Some(region) = self.cursor.region() {
+            if key >= region.range.end.key {
+                return region.range.end.value.unwrap();
+            }
+            let start_key = region.range.start.key;
+            let start_value = region.range.start.value.unwrap();
+            let buffer_start_key = region.buffer_range.start.key;
+            let buffer_start_value = region.buffer_range.start.value.unwrap();
+            let mut buffer_key = buffer_start_key;
+            buffer_key += key - start_key;
+            let buffer_value = (self.convert_buffer_dimension)(region.buffer, buffer_key);
+            let mut result = start_value;
+            result += buffer_value - buffer_start_value;
+            result
+        } else {
+            self.snapshot.max_position()
+        }
+    }
+}
+
+pub struct PointDimensionConverter<'a, MBD>
+where
+    MBD: MultiBufferDimension + Sub + AddAssign<<MBD as Sub>::Output>,
+{
+    snapshot: &'a MultiBufferSnapshot,
+    cursor: MultiBufferCursor<'a, DimensionPair<Point, MBD>, Point>,
+    prev_point: Point,
+}
+
+impl<MBD> PointDimensionConverter<'_, MBD>
+where
+    MBD: MultiBufferDimension + Sub + AddAssign<<MBD as Sub>::Output>,
+{
+    pub fn map(&mut self, point: Point) -> MBD {
+        if point < self.prev_point {
+            self.cursor.seek(&DimensionPair {
+                key: point,
+                value: None,
+            });
+        } else {
+            self.cursor.seek_forward(&DimensionPair {
+                key: point,
+                value: None,
+            });
+        }
+        self.prev_point = point;
+
+        if let Some(region) = self.cursor.region() {
+            let overshoot = point - region.range.start.key;
+            let buffer_point = region.buffer_range.start + overshoot;
+            let mut position = region.range.start.value.unwrap();
+            position.add_text_dim(
+                &region
+                    .buffer
+                    .text_summary_for_range(region.buffer_range.start..buffer_point),
+            );
+            if point == region.range.end.key && region.has_trailing_newline {
+                position.add_mb_text_summary(&MBTextSummary::from(TextSummary::newline()));
+            }
+            position
+        } else {
+            MBD::from_summary(&self.snapshot.text_summary())
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1764,9 +1873,19 @@ impl MultiBuffer {
         let mut selections_by_buffer: HashMap<BufferId, Vec<Selection<text::Anchor>>> =
             Default::default();
 
+        let mut offsets = snapshot
+            .summaries_for_anchors::<MultiBufferOffset, _>(
+                selections
+                    .iter()
+                    .flat_map(|selection| [&selection.start, &selection.end]),
+            )
+            .into_iter();
+        let mut cursor = snapshot.cursor::<MultiBufferOffset, BufferOffset>();
         for selection in selections {
+            let start = offsets.next().unwrap();
+            let end = offsets.next().unwrap();
             for (buffer_snapshot, buffer_range, _) in
-                snapshot.range_to_buffer_ranges(selection.start..selection.end)
+                snapshot.range_to_buffer_ranges_with_cursor(start..end, &mut cursor)
             {
                 selections_by_buffer
                     .entry(buffer_snapshot.remote_id())
@@ -3666,8 +3785,21 @@ impl MultiBufferSnapshot {
         ExcerptRange<text::Anchor>,
     )> {
         let mut cursor = self.cursor::<MultiBufferOffset, BufferOffset>();
-        let start = range.start.to_offset(self);
-        let end = range.end.to_offset(self);
+        let range = range.start.to_offset(self)..range.end.to_offset(self);
+        self.range_to_buffer_ranges_with_cursor(range, &mut cursor)
+    }
+
+    fn range_to_buffer_ranges_with_cursor<'a>(
+        &'a self,
+        range: Range<MultiBufferOffset>,
+        cursor: &mut MultiBufferCursor<'a, MultiBufferOffset, BufferOffset>,
+    ) -> Vec<(
+        &'a BufferSnapshot,
+        Range<BufferOffset>,
+        ExcerptRange<text::Anchor>,
+    )> {
+        let start = range.start;
+        let end = range.end;
         let range_non_empty = end > start;
         cursor.seek(&start);
 
@@ -3706,6 +3838,9 @@ impl MultiBufferSnapshot {
                 } else {
                     result.push((region.buffer, start..end, excerpt_range));
                 }
+            }
+            if end < region.range.end {
+                break;
             }
             cursor.next();
         }
@@ -4125,6 +4260,29 @@ impl MultiBufferSnapshot {
         }
     }
 
+    pub fn as_singleton_without_transforms(&self) -> Option<&BufferSnapshot> {
+        self.singleton_without_transforms()
+            .map(|(_, buffer)| buffer)
+    }
+
+    fn singleton_without_transforms(&self) -> Option<(&Excerpt, &BufferSnapshot)> {
+        if !self.singleton {
+            return None;
+        }
+        let excerpt = self.excerpts.first()?;
+        let buffer = excerpt.buffer_snapshot(self);
+        let excerpts_len = self.excerpts.summary().text.len;
+        let diff_summary = self.diff_transforms.summary();
+        if excerpts_len.0 == buffer.len()
+            && diff_summary.input.len == excerpts_len
+            && diff_summary.output.len == excerpts_len
+        {
+            Some((excerpt, buffer))
+        } else {
+            None
+        }
+    }
+
     pub fn len(&self) -> MultiBufferOffset {
         self.diff_transforms.summary().output.len
     }
@@ -4300,6 +4458,14 @@ impl MultiBufferSnapshot {
         MBD: MultiBufferDimension + Ord + Sub + ops::AddAssign<<MBD as Sub>::Output>,
         BD: TextDimension + Sub<Output = <MBD as Sub>::Output> + AddAssign<<MBD as Sub>::Output>,
     {
+        if let Some((_, buffer)) = self.singleton_without_transforms() {
+            let mut buffer_position = BD::default();
+            buffer_position += position - MBD::default();
+            let clipped = clip_buffer_position(buffer, buffer_position, bias);
+            let mut result = MBD::default();
+            result += clipped - BD::default();
+            return result;
+        }
         let mut cursor = self.cursor::<MBD, BD>();
         cursor.seek(&position);
         if let Some(region) = cursor.region() {
@@ -4331,24 +4497,25 @@ impl MultiBufferSnapshot {
         MBR2: MultiBufferDimension + Ord + Sub + ops::AddAssign<<MBR2 as Sub>::Output>,
         BR2: TextDimension + Sub<Output = <MBR2 as Sub>::Output> + AddAssign<<MBR2 as Sub>::Output>,
     {
-        let mut cursor = self.cursor::<DimensionPair<MBR1, MBR2>, DimensionPair<BR1, BR2>>();
-        cursor.seek(&DimensionPair { key, value: None });
-        if let Some(region) = cursor.region() {
-            if key >= region.range.end.key {
-                return region.range.end.value.unwrap();
-            }
-            let start_key = region.range.start.key;
-            let start_value = region.range.start.value.unwrap();
-            let buffer_start_key = region.buffer_range.start.key;
-            let buffer_start_value = region.buffer_range.start.value.unwrap();
-            let mut buffer_key = buffer_start_key;
-            buffer_key += key - start_key;
-            let buffer_value = convert_buffer_dimension(region.buffer, buffer_key);
-            let mut result = start_value;
-            result += buffer_value - buffer_start_value;
-            result
-        } else {
-            self.max_position()
+        self.dimension_converter(convert_buffer_dimension).map(key)
+    }
+
+    pub fn dimension_converter<MBR1, MBR2, BR1, BR2>(
+        &self,
+        convert_buffer_dimension: fn(&text::BufferSnapshot, BR1) -> BR2,
+    ) -> DimensionConverter<'_, MBR1, MBR2, BR1, BR2>
+    where
+        MBR1: MultiBufferDimension + Ord + Sub + ops::AddAssign<<MBR1 as Sub>::Output>,
+        BR1: TextDimension + Sub<Output = <MBR1 as Sub>::Output> + AddAssign<<MBR1 as Sub>::Output>,
+        MBR2: MultiBufferDimension + Ord + Sub + ops::AddAssign<<MBR2 as Sub>::Output>,
+        BR2: TextDimension + Sub<Output = <MBR2 as Sub>::Output> + AddAssign<<MBR2 as Sub>::Output>,
+    {
+        DimensionConverter {
+            snapshot: self,
+            singleton_buffer: self.as_singleton_without_transforms(),
+            cursor: self.cursor::<DimensionPair<MBR1, MBR2>, DimensionPair<BR1, BR2>>(),
+            convert_buffer_dimension,
+            prev_key: None,
         }
     }
 
@@ -4547,6 +4714,12 @@ impl MultiBufferSnapshot {
     }
 
     pub fn line_len(&self, row: MultiBufferRow) -> u32 {
+        if let Some((_, buffer)) = self.singleton_without_transforms() {
+            if row.0 > buffer.max_point().row {
+                return 0;
+            }
+            return buffer.line_len(row.0);
+        }
         if let Some((_, range)) = self.buffer_line_for_row(row) {
             range.end.column - range.start.column
         } else {
@@ -5142,37 +5315,28 @@ impl MultiBufferSnapshot {
     where
         MBD: MultiBufferDimension + Sub + AddAssign<<MBD as Sub>::Output>,
     {
+        let mut converter = self.point_dimension_converter::<MBD>();
+        let mut points = points.into_iter();
+        iter::from_fn(move || {
+            let point = points.next()?;
+            Some(converter.map(point))
+        })
+    }
+
+    pub fn point_dimension_converter<MBD>(&self) -> PointDimensionConverter<'_, MBD>
+    where
+        MBD: MultiBufferDimension + Sub + AddAssign<<MBD as Sub>::Output>,
+    {
         let mut cursor = self.cursor::<DimensionPair<Point, MBD>, Point>();
         cursor.seek(&DimensionPair {
             key: Point::default(),
             value: None,
         });
-        let mut points = points.into_iter();
-        iter::from_fn(move || {
-            let point = points.next()?;
-
-            cursor.seek_forward(&DimensionPair {
-                key: point,
-                value: None,
-            });
-
-            if let Some(region) = cursor.region() {
-                let overshoot = point - region.range.start.key;
-                let buffer_point = region.buffer_range.start + overshoot;
-                let mut position = region.range.start.value.unwrap();
-                position.add_text_dim(
-                    &region
-                        .buffer
-                        .text_summary_for_range(region.buffer_range.start..buffer_point),
-                );
-                if point == region.range.end.key && region.has_trailing_newline {
-                    position.add_mb_text_summary(&MBTextSummary::from(TextSummary::newline()));
-                }
-                Some(position)
-            } else {
-                Some(MBD::from_summary(&self.text_summary()))
-            }
-        })
+        PointDimensionConverter {
+            snapshot: self,
+            cursor,
+            prev_point: Point::default(),
+        }
     }
 
     pub fn excerpts_for_buffer(
@@ -5208,6 +5372,15 @@ impl MultiBufferSnapshot {
 
     pub fn anchor_at<T: ToOffset>(&self, position: T, mut bias: Bias) -> Anchor {
         let offset = position.to_offset(self);
+
+        if let Some((excerpt, buffer)) = self.singleton_without_transforms() {
+            let offset = offset.0.min(buffer.len());
+            if offset >= buffer.len() && bias == Bias::Right {
+                return Anchor::Max;
+            }
+            let text_anchor = excerpt.clip_anchor(buffer.anchor_at(offset, bias), self);
+            return ExcerptAnchor::in_buffer(excerpt.path_key_index, text_anchor).into();
+        }
 
         // Find the given position in the diff transforms. Determine the corresponding
         // offset in the excerpts, and whether the position is within a deleted hunk.
@@ -6928,6 +7101,12 @@ where
 {
     #[instrument(skip_all)]
     fn seek(&mut self, position: &MBD) {
+        if let Some(Some(region)) = self.cached_region.get()
+            && region.range.start <= *position
+            && *position < region.range.end
+        {
+            return;
+        }
         let position = OutputDimension(*position);
         self.cached_region.take();
         self.diff_transforms.seek(&position, Bias::Right);
@@ -6950,6 +7129,12 @@ where
     }
 
     fn seek_forward(&mut self, position: &MBD) {
+        if let Some(Some(region)) = self.cached_region.get()
+            && region.range.start <= *position
+            && *position < region.range.end
+        {
+            return;
+        }
         let position = OutputDimension(*position);
         self.cached_region.take();
         self.diff_transforms.seek_forward(&position, Bias::Right);

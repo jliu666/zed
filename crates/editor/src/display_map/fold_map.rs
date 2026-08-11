@@ -727,6 +727,11 @@ impl FoldSnapshot {
         !self.folds.is_empty()
     }
 
+    #[inline(always)]
+    pub fn has_tabs(&self) -> bool {
+        self.transforms.summary().output.tabs > 0
+    }
+
     #[ztracing::instrument(skip_all)]
     pub fn text_summary_for_range(&self, range: Range<FoldPoint>) -> MBTextSummary {
         let mut summary = MBTextSummary::default();
@@ -807,6 +812,26 @@ impl FoldSnapshot {
         FoldPointCursor { cursor }
     }
 
+    pub fn fold_point_to_offset_converter(&self) -> FoldPointToOffsetConverter<'_> {
+        FoldPointToOffsetConverter {
+            cursor: self
+                .transforms
+                .cursor::<Dimensions<FoldPoint, TransformSummary>>(()),
+            inlay_converter: self.inlay_snapshot.inlay_point_to_offset_converter(),
+            prev_point: FoldPoint::default(),
+        }
+    }
+
+    pub fn fold_offset_to_point_converter(&self) -> FoldOffsetToPointConverter<'_> {
+        FoldOffsetToPointConverter {
+            cursor: self
+                .transforms
+                .cursor::<Dimensions<FoldOffset, TransformSummary>>(()),
+            inlay_converter: self.inlay_snapshot.inlay_offset_to_point_converter(),
+            prev_offset: FoldOffset::default(),
+        }
+    }
+
     #[ztracing::instrument(skip_all)]
     pub fn len(&self) -> FoldOffset {
         FoldOffset(self.transforms.summary().output.len)
@@ -814,6 +839,12 @@ impl FoldSnapshot {
 
     #[ztracing::instrument(skip_all)]
     pub fn line_len(&self, row: u32) -> u32 {
+        if !self.has_folds()
+            && !self.inlay_snapshot.has_inlays()
+            && let Some(buffer) = self.inlay_snapshot.buffer.as_singleton_without_transforms()
+        {
+            return buffer.line_len(row);
+        }
         let line_start = FoldPoint::new(row, 0).to_offset(self).0;
         let line_end = if row >= self.max_point().row() {
             self.len().0
@@ -1015,6 +1046,63 @@ impl FoldSnapshot {
         } else {
             FoldPoint(self.transforms.summary().output.lines)
         }
+    }
+}
+
+pub struct FoldPointToOffsetConverter<'a> {
+    cursor: Cursor<'a, 'static, Transform, Dimensions<FoldPoint, TransformSummary>>,
+    inlay_converter: super::inlay_map::InlayPointToOffsetConverter<'a>,
+    prev_point: FoldPoint,
+}
+
+pub struct FoldOffsetToPointConverter<'a> {
+    cursor: Cursor<'a, 'static, Transform, Dimensions<FoldOffset, TransformSummary>>,
+    inlay_converter: super::inlay_map::InlayOffsetToPointConverter<'a>,
+    prev_offset: FoldOffset,
+}
+
+impl FoldOffsetToPointConverter<'_> {
+    pub fn map(&mut self, offset: FoldOffset) -> FoldPoint {
+        if !self.cursor.did_seek() || offset < self.prev_offset {
+            self.cursor.seek(&offset, Bias::Right);
+        } else {
+            self.cursor.seek_forward(&offset, Bias::Right);
+        }
+        self.prev_offset = offset;
+
+        let start = self.cursor.start();
+        let overshoot = if self.cursor.item().is_none_or(|t| t.is_fold()) {
+            Point::new(0, (offset.0 - start.0.0) as u32)
+        } else {
+            let inlay_offset = start.1.input.len + (offset - start.0);
+            let inlay_point = self.inlay_converter.map(InlayOffset(inlay_offset));
+            inlay_point.0 - start.1.input.lines
+        };
+        FoldPoint(start.1.output.lines + overshoot)
+    }
+}
+
+impl FoldPointToOffsetConverter<'_> {
+    pub fn map(&mut self, point: FoldPoint) -> FoldOffset {
+        if !self.cursor.did_seek() || point < self.prev_point {
+            self.cursor.seek(&point, Bias::Right);
+        } else {
+            self.cursor.seek_forward(&point, Bias::Right);
+        }
+        self.prev_point = point;
+
+        let start = self.cursor.start();
+        let overshoot = point.0 - start.1.output.lines;
+        let mut offset = start.1.output.len;
+        if !overshoot.is_zero() {
+            let transform = self.cursor.item().expect("display point out of range");
+            assert!(transform.placeholder.is_none());
+            let end_inlay_offset = self
+                .inlay_converter
+                .map(InlayPoint(start.1.input.lines + overshoot));
+            offset += end_inlay_offset.0 - start.1.input.len;
+        }
+        FoldOffset(offset)
     }
 }
 

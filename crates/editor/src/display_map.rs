@@ -135,8 +135,8 @@ use crate::{
 };
 use block_map::{BlockPointCursor, BlockRow, BlockSnapshot};
 use fold_map::{FoldPointCursor, FoldSnapshot};
-use inlay_map::{BufferOffsetToInlayPointCursor, InlaySnapshot};
-use tab_map::{TabPoint, TabPointCursor, TabSnapshot};
+use inlay_map::{BufferOffsetToInlayPointCursor, InlayPointCursor, InlaySnapshot};
+use tab_map::{TabPoint, TabPointCursor, TabPointToFoldPointConverter, TabSnapshot};
 use wrap_map::{WrapMap, WrapPatch, WrapPointCursor};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -1760,6 +1760,25 @@ impl DisplaySnapshot {
             .to_buffer_point(self.display_point_to_inlay_point(point, bias))
     }
 
+    pub fn point_to_display_point_converter(&self) -> PointToDisplayPointConverter<'_> {
+        PointToDisplayPointConverter {
+            inlay_cursor: self.inlay_snapshot().inlay_point_cursor(),
+            fold_cursor: self.fold_snapshot().fold_point_cursor(),
+            tab_cursor: self.tab_snapshot().tab_point_cursor(),
+            wrap_cursor: self.wrap_snapshot().wrap_point_cursor(),
+            block_cursor: self.block_snapshot.block_point_cursor(),
+            prev_point: None,
+            prev_fold_point: None,
+        }
+    }
+
+    pub fn display_point_to_point_converter(&self) -> DisplayPointToPointConverter<'_> {
+        DisplayPointToPointConverter {
+            snapshot: self,
+            tab_converter: self.tab_snapshot().tab_point_to_fold_point_converter(),
+        }
+    }
+
     pub fn display_point_to_inlay_offset(&self, point: DisplayPoint, bias: Bias) -> InlayOffset {
         self.inlay_snapshot()
             .to_offset(self.display_point_to_inlay_point(point, bias))
@@ -1780,10 +1799,7 @@ impl DisplaySnapshot {
         let block_point = point.0;
         let wrap_point = self.block_snapshot.to_wrap_point(block_point, bias);
         let tab_point = self.wrap_snapshot().to_tab_point(wrap_point);
-        let fold_point = self
-            .tab_snapshot()
-            .tab_point_to_fold_point(tab_point, bias)
-            .0;
+        let fold_point = self.tab_snapshot().collapse_tab_point(tab_point, bias);
         fold_point.to_inlay_point(self.fold_snapshot())
     }
 
@@ -1792,9 +1808,7 @@ impl DisplaySnapshot {
         let block_point = point.0;
         let wrap_point = self.block_snapshot.to_wrap_point(block_point, bias);
         let tab_point = self.wrap_snapshot().to_tab_point(wrap_point);
-        self.tab_snapshot()
-            .tab_point_to_fold_point(tab_point, bias)
-            .0
+        self.tab_snapshot().collapse_tab_point(tab_point, bias)
     }
 
     #[instrument(skip_all)]
@@ -2157,10 +2171,10 @@ impl DisplaySnapshot {
     pub fn inlay_bias_at(&self, point: DisplayPoint) -> Option<Bias> {
         let wrap_point = self.block_snapshot.to_wrap_point(point.0, Bias::Left);
         let tab_point = self.block_snapshot.to_tab_point(wrap_point);
-        let (fold_point, _, _) = self
+        let fold_point = self
             .block_snapshot
             .tab_snapshot
-            .tab_point_to_fold_point(tab_point, Bias::Left);
+            .collapse_tab_point(tab_point, Bias::Left);
         let inlay_point =
             fold_point.to_inlay_point(&self.block_snapshot.tab_snapshot.fold_snapshot);
         self.block_snapshot
@@ -2628,10 +2642,7 @@ impl DisplayPoint {
     pub fn to_offset(self, map: &DisplaySnapshot, bias: Bias) -> MultiBufferOffset {
         let wrap_point = map.block_snapshot.to_wrap_point(self.0, bias);
         let tab_point = map.wrap_snapshot().to_tab_point(wrap_point);
-        let fold_point = map
-            .tab_snapshot()
-            .tab_point_to_fold_point(tab_point, bias)
-            .0;
+        let fold_point = map.tab_snapshot().collapse_tab_point(tab_point, bias);
         let inlay_point = fold_point.to_inlay_point(map.fold_snapshot());
         map.inlay_snapshot()
             .to_buffer_offset(map.inlay_snapshot().to_offset(inlay_point))
@@ -2679,6 +2690,63 @@ pub struct DisplayPointConverter<'a> {
     wrap_point_cursor: WrapPointCursor<'a>,
     block_point_cursor: BlockPointCursor<'a>,
     prev_end: Option<MultiBufferOffset>,
+}
+
+pub struct PointToDisplayPointConverter<'a> {
+    inlay_cursor: InlayPointCursor<'a>,
+    fold_cursor: FoldPointCursor<'a>,
+    tab_cursor: TabPointCursor<'a>,
+    wrap_cursor: WrapPointCursor<'a>,
+    block_cursor: BlockPointCursor<'a>,
+    prev_point: Option<Point>,
+    prev_fold_point: Option<FoldPoint>,
+}
+
+impl PointToDisplayPointConverter<'_> {
+    pub fn map(&mut self, point: Point, bias: Bias) -> DisplayPoint {
+        if self.prev_point.is_some_and(|prev_point| point < prev_point) {
+            self.inlay_cursor.reset();
+            self.fold_cursor.reset();
+            self.tab_cursor.reset();
+            self.wrap_cursor.reset();
+            self.block_cursor.reset();
+            self.prev_fold_point = None;
+        }
+        self.prev_point = Some(point);
+
+        let inlay_point = self.inlay_cursor.map(point, Bias::Left);
+        let fold_point = self.fold_cursor.map(inlay_point, bias);
+        if self
+            .prev_fold_point
+            .is_some_and(|prev_fold_point| fold_point < prev_fold_point)
+        {
+            self.wrap_cursor.reset();
+            self.block_cursor.reset();
+        }
+        self.prev_fold_point = Some(fold_point);
+        let tab_point = self.tab_cursor.map(fold_point);
+        let wrap_point = self.wrap_cursor.map(tab_point);
+        DisplayPoint(self.block_cursor.map(wrap_point))
+    }
+}
+
+pub struct DisplayPointToPointConverter<'a> {
+    snapshot: &'a DisplaySnapshot,
+    tab_converter: TabPointToFoldPointConverter<'a>,
+}
+
+impl DisplayPointToPointConverter<'_> {
+    pub fn map(&mut self, point: DisplayPoint, bias: Bias) -> Point {
+        let block_point = point.0;
+        let wrap_point = self
+            .snapshot
+            .block_snapshot
+            .to_wrap_point(block_point, bias);
+        let tab_point = self.snapshot.wrap_snapshot().to_tab_point(wrap_point);
+        let fold_point = self.tab_converter.map(tab_point, bias);
+        let inlay_point = fold_point.to_inlay_point(self.snapshot.fold_snapshot());
+        self.snapshot.inlay_snapshot().to_buffer_point(inlay_point)
+    }
 }
 
 impl DisplayPointConverter<'_> {
@@ -3008,6 +3076,33 @@ pub mod tests {
                 } else {
                     assert_eq!(moved_left, point);
                 }
+            }
+
+            let mut check_rng = rng.clone();
+            let mut points = Vec::new();
+            for _ in 0..10 {
+                let row = check_rng.random_range(0..=buffer.max_point().row);
+                let column = check_rng.random_range(0..=buffer.line_len(MultiBufferRow(row)));
+                points.push(buffer.clip_point(Point::new(row, column), Left));
+            }
+            if check_rng.random_bool(0.5) {
+                points.sort();
+            }
+            let mut forward_converter = snapshot.point_to_display_point_converter();
+            let mut reverse_converter = snapshot.display_point_to_point_converter();
+            for point in points {
+                let bias = if check_rng.random() { Left } else { Right };
+                let display_point = snapshot.point_to_display_point(point, bias);
+                assert_eq!(
+                    forward_converter.map(point, bias),
+                    display_point,
+                    "batched point_to_display_point for {point:?}, {bias:?}"
+                );
+                assert_eq!(
+                    reverse_converter.map(display_point, bias),
+                    snapshot.display_point_to_point(display_point, bias),
+                    "batched display_point_to_point for {display_point:?}, {bias:?}"
+                );
             }
         }
     }
